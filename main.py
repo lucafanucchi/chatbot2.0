@@ -14,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
 
 # Imports do Google
 import gspread
@@ -44,6 +45,11 @@ try:
     print("[✔] Todos os serviços foram inicializados com sucesso.")
 except Exception as e:
     print(f"[!] Erro crítico na inicialização: {e}")
+
+# --- NOVA CLASSE PARA ESTRUTURAR A SAÍDA ---
+class RespostaDoBot(BaseModel):
+    """Define a estrutura de saída JSON que o bot DEVE seguir."""
+    respostas: list[str] = Field(description="Uma lista de strings, onde cada string é uma mensagem separada a ser enviada ao usuário.")
 
 # --- FUNÇÕES DE BANCO DE DADOS ---
 
@@ -136,9 +142,11 @@ def registrar_consulta(nome_completo: str, cpf: str, data_hora_iso: str, telefon
     except Exception as e:
         return f"Erro ao registrar a consulta: {str(e)}"
 
-# --- CONFIGURAÇÃO DO AGENTE LANGCHAIN ---
+# --- CONFIGURAÇÃO DO AGENTE LANGCHAIN (ATUALIZADO) ---
 tools = [verificar_disponibilidade_agenda, registrar_consulta]
 
+# O prompt agora é mais simples. Não precisamos mais implorar pelo JSON,
+# pois a estrutura da API vai forçar isso.
 prompt = ChatPromptTemplate.from_messages([
     ("system", """Você é Gemini, um assistente virtual para a clínica da Dra. Maria.
     Seu objetivo é agendar consultas de forma eficiente e amigável. Responda sempre em português do Brasil.
@@ -150,26 +158,28 @@ prompt = ChatPromptTemplate.from_messages([
     Contexto do Usuário (se houver): {user_context}
 
     Regras de Conversa:
-    1. Se o contexto indicar que você já conhece o usuário (nome e/ou CPF), cumprimente-o pelo nome. Não peça informações que você já possui.
-    2. Se o usuário for novo, apresente-se e siga os passos para agendar: obter nome completo, depois o CPF (11 dígitos), e por fim a data/hora desejada.
-    3. Após obter os dados, use a ferramenta `verificar_disponibilidade_agenda`.
-    4. Após a verificação, confirme TODOS os dados com o usuário antes de agendar.
-    5. Se confirmado, use a ferramenta `registrar_consulta`.
-    6. Se não souber algo, peça para o usuário falar com um humano.
-    7. INSTRUÇÃO DE FORMATAÇÃO DE DATA: Quando apresentar uma data para o usuário, sempre traduza para português (ex: 'Friday' -> 'Sexta-feira').
-
-    Formato da Resposta:
-    Sua resposta final DEVE ser um objeto JSON com UMA chave: "respostas", que é uma lista de strings. Cada string é uma bolha de mensagem.
-    Exemplo: {{"respostas": ["Olá, Luca!", "Como posso te ajudar?"]}}
+    1. Se o contexto indicar que você já conhece o usuário, cumprimente-o pelo nome. Não peça informações que já possui.
+    2. Se o usuário for novo, apresente-se e siga os passos para agendar: nome completo, CPF, e data/hora.
+    3. Sempre use a ferramenta `verificar_disponibilidade_agenda` antes de confirmar um horário.
+    4. Após a verificação, confirme TODOS os dados com o usuário antes de usar a ferramenta `registrar_consulta`.
+    5. INSTRUÇÃO DE FORMATAÇÃO DE DATA: Sempre que apresentar uma data, formate-a em português (ex: 'Friday' -> 'Sexta-feira').
+    6. Sua resposta final deve ser uma lista de uma ou mais mensagens de texto curtas e naturais que façam sentido na conversa.
     """),
     MessagesPlaceholder(variable_name="chat_history"),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-# O JsonOutputParser foi removido da cadeia principal, será chamado manualmente.
-agent = create_openai_tools_agent(llm, tools, prompt)
+# ALTERAÇÃO IMPORTANTE: Ligamos o LLM à nossa estrutura de saída desejada
+llm_with_tools = llm.bind_tools(tools)
+# Forçamos o agente a usar nossa estrutura de resposta E as ferramentas
+agent = create_openai_tools_agent(llm_with_tools, tools, prompt)
+# A partir de agora, o output do agente será estruturado conforme a classe RespostaDoBot
+
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+
+# --- FUNÇÃO RESPONDER E ROTA WEBHOOK (ATUALIZADOS) ---
 
 def responder(mensagens, to):
     """Envia uma ou mais mensagens em TwiML."""
@@ -187,19 +197,18 @@ def responder(mensagens, to):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not llm:
-        return responder("Desculpe, nosso sistema de IA está temporariamente indisponível.", request.form.get("From", "").replace("whatsapp:", ""))
+        return responder("Desculpe, nosso sistema de IA está indisponível.", request.form.get("From", "").replace("whatsapp:", ""))
 
     sender = request.form.get("From", "").replace("whatsapp:", "")
     text = request.form.get("Body", "").strip()
     print(f"[← {sender}] {text}")
 
     user_data, chat_history = load_user_data(sender)
-    is_new_user = user_data is None
-    if is_new_user:
+    if user_data is None:
         user_data = {}
     
-    user_context = json.dumps(user_data) if not is_new_user else "Este é um novo usuário. Apresente-se e peça o nome completo."
-
+    user_context = json.dumps(user_data) if user_data else "Este é um novo usuário. Apresente-se e peça o nome completo."
+        
     try:
         now_br = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3)))
         current_time_str = now_br.strftime("%A, %d de %B de %Y, %H:%M")
@@ -211,23 +220,20 @@ def webhook():
             "user_context": user_context
         })
         
-        # CORREÇÃO: Acessamos a chave 'output' para pegar o JSON gerado pelo agente.
-        output_str = result.get("output", "{}")
-        output_json = json.loads(output_str)
-        lista_de_respostas = output_json.get("respostas", ["Desculpe, não consegui processar minha resposta."])
+        # CORREÇÃO PRINCIPAL: Agora o `output` deve ser um dicionário que corresponde
+        # à nossa classe RespostaDoBot, então podemos acessá-lo diretamente.
+        output_dict = result.get("output", {})
+        lista_de_respostas = output_dict.get("respostas", ["Desculpe, não consegui processar minha resposta."])
 
-    except (json.JSONDecodeError, AttributeError, KeyError) as e:
-        print(f"[!] Erro ao processar a saída do agente: {e}\nSaída recebida: {result.get('output', '')}")
-        lista_de_respostas = ["Desculpe, estou com um pouco de dificuldade para organizar minhas ideias. Poderia repetir, por favor?"]
     except Exception as e:
-        print(f"[!] Erro desconhecido ao invocar o agente: {e}")
+        print(f"[!] Erro ao invocar ou processar a saída do agente: {e}")
         lista_de_respostas = ["Desculpe, ocorreu um erro interno. Por favor, tente novamente."]
 
-    # CORREÇÃO: Lógica para extrair e salvar os dados aprendidos.
-    # Esta é uma abordagem simplificada. Uma versão mais avançada teria uma ferramenta específica para isso.
+    resposta_concatenada = " ".join(lista_de_respostas)
+    chat_history.extend([HumanMessage(content=text), AIMessage(content=resposta_concatenada)])
+    
+    # Lógica simplificada para salvar os dados aprendidos
     try:
-        # A ferramenta registrar_consulta é a fonte da verdade para os dados finais.
-        # Vamos olhar o "pensamento" do agente para ver se ele chamou essa ferramenta.
         if 'tool_calls' in result.get('intermediate_steps', [({},)])[-1][0].log:
             tool_calls = result['intermediate_steps'][-1][0].log.tool_calls
             for call in tool_calls:
@@ -236,12 +242,8 @@ def webhook():
                     user_data['nome'] = args.get('nome_completo')
                     user_data['cpf'] = args.get('cpf')
                     print(f"[i] Dados extraídos da chamada de ferramenta: Nome={user_data['nome']}, CPF={user_data['cpf']}")
-    except Exception:
-        pass # Ignora erros se a estrutura não for a esperada.
+    except Exception: pass
         
-    resposta_concatenada = " ".join(lista_de_respostas)
-    chat_history.extend([HumanMessage(content=text), AIMessage(content=resposta_concatenada)])
-    
     save_user_data(sender, user_data, chat_history[-10:])
 
     return responder(lista_de_respostas, sender)
