@@ -15,6 +15,10 @@ from langchain.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import JsonOutputParser
 
+# Imports do Google
+from google.oauth2.service_account import Credentials # <-- ESTA LINHA ESTAVA FALTANDO
+from googleapiclient.discovery import build
+
 # --- Configuração de Localidade para Datas em Português ---
 try:
     locale.setlocale(locale.LC_TIME, 'pt_BR.UTF-8')
